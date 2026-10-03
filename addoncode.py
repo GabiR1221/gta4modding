@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GTA IV Blender Tools (ODR/WDD)",
     "author": "Tu si AI-ul",
-    "version": (1, 0, 2),
+    "version": (1, 2, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > GTA IV Tool",
     "description": "Importa si exporta modele GTA IV (OpenFormats)",
@@ -16,6 +16,7 @@ import re
 from bpy.props import StringProperty, BoolProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ImportHelper
+from mathutils.kdtree import KDTree
 
 SKEL_BONES = []
 
@@ -33,62 +34,152 @@ GTA_BOUNDS = {
     "lowr_001_u": (-0.22414200, -0.13857100, -0.95130000, 0.22564400, 0.17427200, 0.04853700),
 }
 
-# FIX: Head/hair/teef -> 100% Char_Head (single bone, fara deformare de la spine/neck)
-AUTO_BONE_PATTERNS = {
-    "head_000_r": [("Char_Head", 255), (None, 0), (None, 0), (None, 0)],
-    "teef_000_u": [("Char_Head", 255), (None, 0), (None, 0), (None, 0)],
-    "hair_000_u": [("Char_Head", 255), (None, 0), (None, 0), (None, 0)],
-    "hand_000_r": [("Char_R_Hand", 255), (None, 0), (None, 0), (None, 0)],
-    "feet_000_u": [("Char_L_Foot", 255), (None, 0), (None, 0), (None, 0)],
-    "feet_001_u": [("Char_R_Foot", 255), (None, 0), (None, 0), (None, 0)],
-}
-
-
 def clean_name(name):
     return re.sub(r'\.\d{3}$', '', name)
 
 
-def find_bone_idx(name_to_idx, candidates):
-    for c in candidates:
-        if c is None:
-            continue
-        if c in name_to_idx:
-            return name_to_idx[c]
-    lower_map = {k.lower(): v for k, v in name_to_idx.items()}
-    for c in candidates:
-        if c is None:
-            continue
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
-    for c in candidates:
-        if c is None:
-            continue
-        for prefix in ["Char_", "char_"]:
-            key = prefix + c
-            if key in name_to_idx:
-                return name_to_idx[key]
-    for c in candidates:
-        if c is None:
-            continue
-        cl = c.lower()
-        for key, idx in name_to_idx.items():
-            if key.lower().endswith("_" + cl) or key.lower() == cl:
-                return idx
-    return None
+def decode_gta_weights(packed_weights):
+    """Decode GTA IV's cumulative 4-byte skin-weight representation.
+
+    The values in an OpenFormats mesh are cumulative, not four independent
+    weights.  For example ``171 214 255 255`` means 171, 43, 41 and 0.
+    Treating them as independent weights (or replacing them with 255 0 0 0)
+    changes the bind pose and makes heads/hands detach in-game.
+    """
+    result = []
+    previous = 0
+    for value in packed_weights[:4]:
+        current = max(previous, min(255, int(value)))
+        result.append((current - previous) / 255.0)
+        previous = current
+    return result + [0.0] * (4 - len(result))
 
 
-def resolve_pattern(name_to_idx, pattern):
-    b_idx = [0, 0, 0, 0]
-    b_wgt = [0, 0, 0, 0]
-    for i, (bone_name, weight) in enumerate(pattern):
-        if bone_name is None or weight == 0:
-            continue
-        idx = find_bone_idx(name_to_idx, [bone_name])
-        if idx is not None:
-            b_idx[i] = idx
-            b_wgt[i] = weight
-    return b_idx, b_wgt
+def encode_gta_weights(influences):
+    """Encode normalized ``(bone_index, weight)`` pairs for GTA IV meshes."""
+    influences = [(index, weight) for index, weight in influences if weight > 0.0]
+    influences.sort(key=lambda item: item[1], reverse=True)
+    influences = influences[:4]
+    total = sum(weight for _, weight in influences)
+    if total <= 0.0:
+        return [0, 0, 0, 0], [0, 0, 0, 0]
 
+    # GTA uses cumulative bytes.  Rounding each independent weight first can
+    # leave a total other than 255, so correct the largest influence.
+    discrete = [int(round(weight / total * 255.0)) for _, weight in influences]
+    discrete[0] += 255 - sum(discrete)
+    bone_indices = [index for index, _ in influences]
+    while len(bone_indices) < 4:
+        bone_indices.append(bone_indices[-1])
+        discrete.append(0)
+
+    packed = []
+    cumulative = 0
+    for weight in discrete:
+        cumulative = max(cumulative, min(255, cumulative + weight))
+        packed.append(cumulative)
+    packed[-1] = 255
+    return bone_indices, packed
+
+
+def has_valid_gta_weights(weights):
+    """Return whether a packed GTA IV weight vector can be used as-is.
+
+    A valid packed vector always terminates at 255.  Old versions of this
+    addon wrote rigid data such as ``255 0 0 0``; preserving that metadata on a
+    later export silently keeps the detached-head bug alive.
+    """
+    return len(weights) == 4 and all(0 <= int(weight) <= 255 for weight in weights) and weights[-1] == 255
+
+
+def has_non_rigid_ped_skin(mesh_name, obj, name_to_idx):
+    """Ensure head/hand meshes were not inherited from the old rigid export."""
+    required_bone = {
+        "head_000_r": "Char_Head",
+        "hand_000_r": "Char_R_Hand",
+    }.get(mesh_name)
+    if required_bone is None:
+        return True
+
+    required_idx = name_to_idx.get(required_bone)
+    for vertex in obj.data.vertices:
+        influences = [
+            obj.vertex_groups[group.group].name
+            for group in vertex.groups
+            if group.weight > 0.0 and obj.vertex_groups[group.group].name in name_to_idx
+        ]
+        # At least one vertex must blend with a bone other than the rigid root.
+        if any(name_to_idx[name] != required_idx for name in influences):
+            return True
+    return False
+
+
+def mesh_name_from_object(obj):
+    """Return the OpenFormats mesh name used for an object."""
+    raw_name = clean_name(obj.name)
+    return raw_name.replace("_high", "").replace(".mesh", "")
+
+
+def blender_copy_index(name):
+    """Return Blender's numeric copy suffix, or -1 for the original object."""
+    match = re.search(r'\.(\d{3})$', name)
+    return int(match.group(1)) if match else -1
+
+
+def unique_export_meshes(objects):
+    """Choose one object per output mesh name.
+
+    ``head_000_r`` and ``head_000_r.001`` both write ``head_000_r.mesh``.
+    Exporting both also writes duplicate gtaDrawable entries to the ODD.  Prefer
+    the highest Blender copy suffix, which is normally the edited replacement.
+    """
+    chosen = {}
+    for obj in objects:
+        mesh_name = mesh_name_from_object(obj)
+        current = chosen.get(mesh_name)
+        if current is None or blender_copy_index(obj.name) > blender_copy_index(current.name):
+            chosen[mesh_name] = obj
+    return list(chosen.values())
+
+
+def find_reference_skin_source(target, mesh_name):
+    """Find an untouched imported copy of the same GTA mesh in the scene.
+
+    Data Transfer can alter Blender group values and group order.  When the
+    original imported head is still present, its raw OpenFormats skin entries
+    are the authoritative data.  We transfer those entries by closest vertex
+    at export time, avoiding a lossy Blender-group round trip.
+    """
+    for candidate in bpy.data.objects:
+        if candidate == target or candidate.type != 'MESH':
+            continue
+        if mesh_name_from_object(candidate) != mesh_name:
+            continue
+        data = candidate.data
+        try:
+            indices = json.loads(data["gta_bone_indices"])
+            weights = json.loads(data["gta_bone_weights"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (len(indices) == len(data.vertices) and len(weights) == len(data.vertices)
+                and all(has_valid_gta_weights(entry) for entry in weights)):
+            return candidate, indices, weights
+    return None, None, None
+
+
+def build_reference_skin_tree(reference_vertices):
+    """Build a nearest-vertex index once instead of scanning per target vertex."""
+    tree = KDTree(len(reference_vertices))
+    for index, vertex in enumerate(reference_vertices):
+        tree.insert(vertex.co, index)
+    tree.balance()
+    return tree
+
+
+def nearest_reference_skin(target_vertex, reference_tree, reference_indices, reference_weights):
+    """Return exact raw skin data from the closest reference vertex."""
+    _, closest_index, _ = reference_tree.find(target_vertex.co)
+    return reference_indices[closest_index], reference_weights[closest_index]
 
 def parse_skel_file(filepath):
     bones = []
@@ -231,10 +322,13 @@ class GTA4_OT_ImportMesh(Operator, ImportHelper):
             for b in SKEL_BONES:
                 obj.vertex_groups.new(name=b["name"])
             for v_idx, (b_idx, raw_wgt) in enumerate(zip(bone_indices, bone_weights)):
-                total = sum(raw_wgt) if sum(raw_wgt) > 0 else 1
+                decoded_weights = decode_gta_weights(raw_wgt)
+                weights_by_bone = {}
                 for i, idx in enumerate(b_idx):
-                    if idx in idx_to_name and i < len(raw_wgt) and raw_wgt[i] > 0:
-                        obj.vertex_groups[idx_to_name[idx]].add([v_idx], raw_wgt[i] / total, 'REPLACE')
+                    if idx in idx_to_name and i < len(decoded_weights) and decoded_weights[i] > 0.0:
+                        weights_by_bone[idx] = weights_by_bone.get(idx, 0.0) + decoded_weights[i]
+                for idx, weight in weights_by_bone.items():
+                    obj.vertex_groups[idx_to_name[idx]].add([v_idx], weight, 'REPLACE')
             arm_obj = next((o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
             if arm_obj:
                 obj.parent = arm_obj
@@ -262,6 +356,11 @@ class GTA4_OT_ExportWDD(Operator, ImportHelper):
         if not selected:
             self.report({'ERROR'}, "Selecteaza cel putin un mesh!")
             return {'CANCELLED'}
+        export_meshes = unique_export_meshes(selected)
+        if len(export_meshes) != len(selected):
+            skipped = len(selected) - len(export_meshes)
+            self.report({'WARNING'}, f"{skipped} duplicat(e) ignorat(e): export un singur mesh pentru fiecare nume GTA.")
+            print(f"[GTA4 EXPORT] Ignor duplicate Blender: {len(selected)} selectate -> {len(export_meshes)} mesh-uri GTA")
 
         filepath = self.filepath
         if filepath.endswith(('/', '\\')) or os.path.isdir(filepath):
@@ -301,7 +400,7 @@ class GTA4_OT_ExportWDD(Operator, ImportHelper):
 
         odd_content = "Version 110 12\n{\n"
 
-        for obj in selected:
+        for obj in export_meshes:
             raw_name = clean_name(obj.name)
             mesh_name = raw_name.replace("_high", "").replace(".mesh", "")
             mesh_filename = f"{raw_name}.mesh" if not raw_name.endswith(".mesh") else raw_name
@@ -384,23 +483,57 @@ class GTA4_OT_ExportWDD(Operator, ImportHelper):
             except Exception as e:
                 self.report({'WARNING'}, f"Eroare: {e}")
 
-            # CRITICAL FIX: daca avem pattern definit pentru acest mesh, IL FOLOSIM MEREU
-            # (nu mai folosim weights vechi din metadata)
-            has_pattern = mesh_name in AUTO_BONE_PATTERNS
+            # Preserve raw data for an untouched imported mesh.  For edited
+            # geometry Blender vertex groups are the source of truth: edit
+            # operations interpolate them, while old per-vertex metadata no
+            # longer matches the changed vertex count.
+            has_vertex_group_weights = any(
+                any(group.weight > 0.0 and obj.vertex_groups[group.group].name in name_to_idx
+                    for group in vertex.groups)
+                for vertex in mesh_data.vertices
+            )
             use_original = (stored_indices is not None
                             and len(stored_indices) == len(mesh_data.vertices)
-                            and not has_pattern)  # FORTAM pattern daca exista
+                            and all(has_valid_gta_weights(weights) for weights in stored_weights))
 
-            auto_b_idx = None
-            auto_b_wgt = None
-            if has_pattern:
-                auto_b_idx, auto_b_wgt = resolve_pattern(name_to_idx, AUTO_BONE_PATTERNS[mesh_name])
-                print(f"[GTA4 EXPORT] FORTAT pattern pentru {mesh_name}: bones={auto_b_idx}, weights={auto_b_wgt}")
-                self.report({'INFO'}, f"Pattern {mesh_name}: bones={auto_b_idx}, wgt={auto_b_wgt}")
-            elif use_original:
+            reference_obj = None
+            reference_indices = None
+            reference_weights = None
+            head_reference_obj = None
+            # A GTA IV facial head needs its original per-vertex skin mapping.
+            # Data Transfer cannot reproduce that mapping reliably when the
+            # replacement has a different vertex count/topology.
+            if not use_original and mesh_name != "head_000_r":
+                reference_obj, reference_indices, reference_weights = find_reference_skin_source(obj, mesh_name)
+            elif not use_original and mesh_name == "head_000_r":
+                head_reference_obj, _, _ = find_reference_skin_source(obj, mesh_name)
+                if (head_reference_obj is not None
+                        and len(head_reference_obj.data.vertices) != len(mesh_data.vertices)):
+                    self.report({'ERROR'},
+                        "head_000_r: topologie diferita. Porneste din capul original, NU adauga/sterge vertex-uri, apoi modeleaza-l.")
+                    print("[GTA4 EXPORT] STOP head_000_r: "
+                          f"{len(mesh_data.vertices)} verts vs referinta {len(head_reference_obj.data.vertices)}. "
+                          "Skin-ul facial GTA IV necesita topologia originala.")
+                    return {'CANCELLED'}
+            use_reference_skin = reference_obj is not None
+            has_safe_ped_skin = has_non_rigid_ped_skin(mesh_name, obj, name_to_idx)
+
+            if use_original:
                 print(f"[GTA4 EXPORT] Folosesc metadata originala ({len(stored_indices)} verts)")
+            elif use_reference_skin:
+                print(f"[GTA4 EXPORT] Transfer skin raw din '{reference_obj.name}' ({len(reference_indices)} verts)")
+            elif has_vertex_group_weights and has_safe_ped_skin:
+                print("[GTA4 EXPORT] Folosesc vertex groups Blender si encodez weights cumulative GTA IV")
             else:
-                print(f"[GTA4 EXPORT] FARA pattern si FARA metadata - fallback vertex groups")
+                if mesh_name in ("head_000_r", "hand_000_r") and not has_safe_ped_skin:
+                    self.report({'ERROR'}, f"{mesh_name}: skinning rigid detectat. Importa mesh-ul ORIGINAL, transfera weights, apoi exporta.")
+                else:
+                    self.report({'ERROR'}, f"{mesh_name}: mesh fara skin weights. Importa mesh-ul original si pastreaza/transfera vertex groups.")
+                return {'CANCELLED'}
+
+            reference_skin_tree = None
+            if use_reference_skin:
+                reference_skin_tree = build_reference_skin_tree(reference_obj.data.vertices)
 
             with open(mesh_filepath, 'w', encoding='utf-8', newline='\r\n') as f:
                 f.write("Version 11 13\n{\n\tSkinned 1\n\tMtl 0\n\t{\n\t\tPrim 0\n\t\t{\n")
@@ -422,16 +555,16 @@ class GTA4_OT_ExportWDD(Operator, ImportHelper):
                     pos = f"{v.co.x:.8f} {v.co.y:.8f} {v.co.z:.8f}"
                     norm = f"{v.normal.x:.8f} {v.normal.y:.8f} {v.normal.z:.8f}"
 
-                    if auto_b_idx is not None:
-                        b_idx = auto_b_idx
-                        b_wgt = auto_b_wgt
-                        tang = [0.0, 0.0, 0.0, 1.0]
-                        col = [1.0, 1.0, 1.0, 0.0]
-                    elif use_original:
+                    if use_original:
                         b_idx = stored_indices[v_idx]
                         b_wgt = stored_weights[v_idx]
                         tang = stored_tangents[v_idx]
                         col = stored_colors[v_idx]
+                    elif use_reference_skin:
+                        b_idx, b_wgt = nearest_reference_skin(
+                            v, reference_skin_tree, reference_indices, reference_weights)
+                        tang = [0.0, 0.0, 0.0, 1.0]
+                        col = [1.0, 1.0, 1.0, 0.0]
                     else:
                         vg_weights = []
                         for g in v.groups:
@@ -439,20 +572,7 @@ class GTA4_OT_ExportWDD(Operator, ImportHelper):
                                 gname = obj.vertex_groups[g.group].name
                                 if gname in name_to_idx:
                                     vg_weights.append((name_to_idx[gname], g.weight))
-                        vg_weights.sort(key=lambda x: x[0])
-                        vg_weights = vg_weights[:4]
-                        total_w = sum(w for _, w in vg_weights)
-                        if total_w > 0:
-                            vg_weights = [(i, w / total_w) for i, w in vg_weights]
-                        b_idx = [0, 0, 0, 0]
-                        b_wgt = [0, 0, 0, 0]
-                        for i, (bidx, w) in enumerate(vg_weights):
-                            b_idx[i] = bidx
-                            b_wgt[i] = int(round(w * 255.0))
-                        if vg_weights:
-                            diff = 255 - sum(b_wgt)
-                            if diff != 0:
-                                b_wgt[0] = max(0, min(255, b_wgt[0] + diff))
+                        b_idx, b_wgt = encode_gta_weights(vg_weights)
                         tang = [0.0, 0.0, 0.0, 1.0]
                         col = [1.0, 1.0, 1.0, 0.0]
 
