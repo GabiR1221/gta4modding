@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GTA IV Blender Tools (ODR/WDD)",
     "author": "Tu si AI-ul",
-    "version": (1, 2, 0),
+    "version": (1, 5, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > GTA IV Tool",
     "description": "Importa si exporta modele GTA IV (OpenFormats)",
@@ -9,6 +9,7 @@ bl_info = {
 }
 
 import bpy
+import bmesh
 import os
 import math
 import json
@@ -16,7 +17,7 @@ import re
 from bpy.props import StringProperty, BoolProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ImportHelper
-from mathutils.kdtree import KDTree
+from mathutils.bvhtree import BVHTree
 
 SKEL_BONES = []
 
@@ -39,13 +40,7 @@ def clean_name(name):
 
 
 def decode_gta_weights(packed_weights):
-    """Decode GTA IV's cumulative 4-byte skin-weight representation.
-
-    The values in an OpenFormats mesh are cumulative, not four independent
-    weights.  For example ``171 214 255 255`` means 171, 43, 41 and 0.
-    Treating them as independent weights (or replacing them with 255 0 0 0)
-    changes the bind pose and makes heads/hands detach in-game.
-    """
+    """Decode GTA IV's cumulative 4-byte skin-weight representation."""
     result = []
     previous = 0
     for value in packed_weights[:4]:
@@ -64,8 +59,6 @@ def encode_gta_weights(influences):
     if total <= 0.0:
         return [0, 0, 0, 0], [0, 0, 0, 0]
 
-    # GTA uses cumulative bytes.  Rounding each independent weight first can
-    # leave a total other than 255, so correct the largest influence.
     discrete = [int(round(weight / total * 255.0)) for _, weight in influences]
     discrete[0] += 255 - sum(discrete)
     bone_indices = [index for index, _ in influences]
@@ -83,12 +76,7 @@ def encode_gta_weights(influences):
 
 
 def has_valid_gta_weights(weights):
-    """Return whether a packed GTA IV weight vector can be used as-is.
-
-    A valid packed vector always terminates at 255.  Old versions of this
-    addon wrote rigid data such as ``255 0 0 0``; preserving that metadata on a
-    later export silently keeps the detached-head bug alive.
-    """
+    """Return whether a packed GTA IV weight vector can be used as-is."""
     return len(weights) == 4 and all(0 <= int(weight) <= 255 for weight in weights) and weights[-1] == 255
 
 
@@ -108,7 +96,6 @@ def has_non_rigid_ped_skin(mesh_name, obj, name_to_idx):
             for group in vertex.groups
             if group.weight > 0.0 and obj.vertex_groups[group.group].name in name_to_idx
         ]
-        # At least one vertex must blend with a bone other than the rigid root.
         if any(name_to_idx[name] != required_idx for name in influences):
             return True
     return False
@@ -127,12 +114,7 @@ def blender_copy_index(name):
 
 
 def unique_export_meshes(objects):
-    """Choose one object per output mesh name.
-
-    ``head_000_r`` and ``head_000_r.001`` both write ``head_000_r.mesh``.
-    Exporting both also writes duplicate gtaDrawable entries to the ODD.  Prefer
-    the highest Blender copy suffix, which is normally the edited replacement.
-    """
+    """Choose one object per output mesh name."""
     chosen = {}
     for obj in objects:
         mesh_name = mesh_name_from_object(obj)
@@ -143,13 +125,7 @@ def unique_export_meshes(objects):
 
 
 def find_reference_skin_source(target, mesh_name):
-    """Find an untouched imported copy of the same GTA mesh in the scene.
-
-    Data Transfer can alter Blender group values and group order.  When the
-    original imported head is still present, its raw OpenFormats skin entries
-    are the authoritative data.  We transfer those entries by closest vertex
-    at export time, avoiding a lossy Blender-group round trip.
-    """
+    """Find an untouched imported copy of the same GTA mesh in the scene."""
     for candidate in bpy.data.objects:
         if candidate == target or candidate.type != 'MESH':
             continue
@@ -167,19 +143,147 @@ def find_reference_skin_source(target, mesh_name):
     return None, None, None
 
 
-def build_reference_skin_tree(reference_vertices):
-    """Build a nearest-vertex index once instead of scanning per target vertex."""
-    tree = KDTree(len(reference_vertices))
-    for index, vertex in enumerate(reference_vertices):
-        tree.insert(vertex.co, index)
-    tree.balance()
-    return tree
+def build_reference_skin_surface(reference_obj):
+    """Build a BVH over the original mesh and retain its triangle vertices."""
+    mesh = reference_obj.data
+    mesh.calc_loop_triangles()
+    triangles = [tuple(triangle.vertices) for triangle in mesh.loop_triangles]
+    if not triangles:
+        return None, []
+    tree = BVHTree.FromPolygons(
+        [vertex.co.copy() for vertex in mesh.vertices], triangles,
+        all_triangles=True,
+    )
+    return tree, triangles
 
 
-def nearest_reference_skin(target_vertex, reference_tree, reference_indices, reference_weights):
-    """Return exact raw skin data from the closest reference vertex."""
-    _, closest_index, _ = reference_tree.find(target_vertex.co)
-    return reference_indices[closest_index], reference_weights[closest_index]
+def barycentric_coordinates(point, a, b, c):
+    """Return stable barycentric coordinates for ``point`` on triangle abc."""
+    ab = b - a
+    ac = c - a
+    ap = point - a
+    dot_ab_ab = ab.dot(ab)
+    dot_ab_ac = ab.dot(ac)
+    dot_ac_ac = ac.dot(ac)
+    dot_ap_ab = ap.dot(ab)
+    dot_ap_ac = ap.dot(ac)
+    denominator = dot_ab_ab * dot_ac_ac - dot_ab_ac * dot_ab_ac
+    if abs(denominator) < 1e-20:
+        return 1.0, 0.0, 0.0
+    v = (dot_ac_ac * dot_ap_ab - dot_ab_ac * dot_ap_ac) / denominator
+    w = (dot_ab_ab * dot_ap_ac - dot_ab_ac * dot_ap_ab) / denominator
+    return 1.0 - v - w, v, w
+
+
+def interpolate_reference_skin(target_vertex, reference_obj, reference_tree,
+                               reference_triangles, reference_indices,
+                               reference_weights):
+    """Transfer GTA skin data from the closest source triangle."""
+    nearest = reference_tree.find_nearest(target_vertex.co)
+    if nearest is None:
+        raise ValueError("Referinta nu contine triunghiuri pentru skin transfer")
+    location, _normal, triangle_index, distance = nearest
+    source_vertices = reference_triangles[triangle_index]
+    source_coords = [reference_obj.data.vertices[index].co for index in source_vertices]
+    barycentric = barycentric_coordinates(location, *source_coords)
+
+    influences = {}
+    for vertex_index, factor in zip(source_vertices, barycentric):
+        if factor <= 0.0:
+            continue
+        for bone_index, weight in zip(
+                reference_indices[vertex_index], decode_gta_weights(reference_weights[vertex_index])):
+            if weight > 0.0:
+                influences[bone_index] = influences.get(bone_index, 0.0) + factor * weight
+    bone_indices, packed_weights = encode_gta_weights(list(influences.items()))
+    return bone_indices, packed_weights, source_vertices, barycentric, distance
+
+
+def interpolate_reference_attributes(source_vertices, barycentric, reference_tangents,
+                                     reference_colors, reference_uvs):
+    """Barycentrically transfer attributes that are stored per source vertex."""
+    def blend(values, default):
+        if not values or any(index >= len(values) for index in source_vertices):
+            return default
+        component_count = len(values[source_vertices[0]])
+        return [sum(factor * values[index][component]
+                    for index, factor in zip(source_vertices, barycentric))
+                for component in range(component_count)]
+
+    return (blend(reference_tangents, [0.0, 0.0, 0.0, 1.0]),
+            blend(reference_colors, [1.0, 1.0, 1.0, 0.0]),
+            blend(reference_uvs, [0.0, 0.0]))
+
+
+def duplicate_and_prepare_geometry(context, obj):
+    """Duplica obiectul, trianguleaza, despica TOATE muchiile si pastreaza
+    normal-urile smooth originale ca custom split normals.
+
+    De ce: dupa split_edges fiecare vertex apartine unei singure fete, deci
+    Blender nu mai poate interpola normal-uri -> mesh-ul devine flat-shaded.
+    Rezolvam salvand normal-urile vertexilor din mesh-ul ORIGINAL (smooth)
+    intr-un dict cheiat pe pozitie, apoi le re-aplicam ca custom split normals.
+    """
+    from mathutils import Vector
+
+    # Selectam doar obiectul tinta
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+
+    if context.object and context.object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    # 1. Capturam normal-urile smooth din mesh-ul ORIGINAL inainte de split.
+    #    Le cheiem pe pozitie rotunjita (split_edges duplica verticii pastrand
+    #    coordonatele exacte, deci putem face lookup dupa split).
+    original_mesh = obj.data
+    try:
+        original_mesh.calc_normals()
+    except AttributeError:
+        pass  # Blender 4.x nu mai are calc_normals
+
+    pos_to_normal = {}
+    for v in original_mesh.vertices:
+        key = (round(v.co.x, 6), round(v.co.y, 6), round(v.co.z, 6))
+        pos_to_normal[key] = v.normal.copy()
+
+    # 2. Duplicam cu mesh data nou, independent
+    bpy.ops.object.duplicate(linked=False)
+    duplicate = context.view_layer.objects.active
+
+    # 3. Procesam cu bmesh
+    bm = bmesh.new()
+    bm.from_mesh(duplicate.data)
+    bmesh.ops.triangulate(bm, faces=bm.faces[:], quad_method='BEAUTY', ngon_method='BEAUTY')
+    bmesh.ops.split_edges(bm, edges=bm.edges[:])
+    bm.to_mesh(duplicate.data)
+    bm.free()
+    duplicate.data.update()
+
+    # 4. Re-aplicam normal-urile smooth originale ca custom split normals.
+    dup_mesh = duplicate.data
+    fallback = Vector((0.0, 0.0, 1.0))
+    custom_normals = []
+    for loop in dup_mesh.loops:
+        v = dup_mesh.vertices[loop.vertex_index]
+        key = (round(v.co.x, 6), round(v.co.y, 6), round(v.co.z, 6))
+        custom_normals.append(pos_to_normal.get(key, fallback))
+
+    # In Blender 3.x trebuie activat use_auto_smooth; in 4.1+ nu mai exista.
+    if hasattr(dup_mesh, "use_auto_smooth"):
+        dup_mesh.use_auto_smooth = True
+        dup_mesh.auto_smooth_angle = math.pi  # 180 grade -> smooth total
+
+    try:
+        dup_mesh.normals_split_custom_set(custom_normals)
+        for poly in dup_mesh.polygons:
+            poly.use_smooth = True
+    except Exception as e:
+        print(f"[GTA4 EXPORT] Nu am putut aplica custom normals: {e}")
+
+    return duplicate
+
 
 def parse_skel_file(filepath):
     bones = []
@@ -284,7 +388,6 @@ class GTA4_OT_ImportSkel(Operator, ImportHelper):
         SKEL_BONES = parse_skel_file(self.filepath)
         create_armature(SKEL_BONES, name=os.path.basename(self.filepath).split(".")[0])
         self.report({'INFO'}, f"Schelet: {len(SKEL_BONES)} oase. Primul: {SKEL_BONES[0]['name']}")
-        # Debug: print bone indices for known bones
         for i, b in enumerate(SKEL_BONES):
             if b["name"] in ("Char_Head", "Char_Neck", "Char_Spine3", "Char_R_Hand", "Char_L_Foot", "Char_R_Foot"):
                 print(f"[GTA4 SKEL] idx={i} bone={b['name']} pos={b['head']}")
@@ -376,7 +479,6 @@ class GTA4_OT_ExportWDD(Operator, ImportHelper):
         name_to_idx = {b["name"]: i for i, b in enumerate(SKEL_BONES)}
         skel_name = "ig_roman"
 
-        # Debug: verify Char_Head exists in skeleton
         if "Char_Head" not in name_to_idx:
             self.report({'ERROR'}, f"Char_Head NU EXISTA in schelet! Bones: {list(name_to_idx.keys())[:20]}")
             return {'CANCELLED'}
@@ -400,214 +502,252 @@ class GTA4_OT_ExportWDD(Operator, ImportHelper):
 
         odd_content = "Version 110 12\n{\n"
 
-        for obj in export_meshes:
-            raw_name = clean_name(obj.name)
-            mesh_name = raw_name.replace("_high", "").replace(".mesh", "")
-            mesh_filename = f"{raw_name}.mesh" if not raw_name.endswith(".mesh") else raw_name
-            mesh_filepath = os.path.join(mesh_dir, mesh_filename)
+        modify_geometry = bool(getattr(context.scene, "gta4_modify_geometry", False))
+        if modify_geometry:
+            print("[GTA4 EXPORT] Modify Geometry ACTIVAT - se vor crea copii cu muchii despicate pentru UV per-vertex.")
 
-            # IMPORTANT: aplicam transformarile obiectului inainte de a citi vertexii
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-            try:
-                bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-            except Exception as e:
-                self.report({'WARNING'}, f"Nu am putut aplica transformarile: {e}")
+        duplicates_to_cleanup = []
 
-            mesh_data = obj.data
-            mesh_data.calc_loop_triangles()
+        try:
+            for original_obj in export_meshes:
+                raw_name = clean_name(original_obj.name)
+                mesh_name = raw_name.replace("_high", "").replace(".mesh", "")
+                mesh_filename = f"{raw_name}.mesh" if not raw_name.endswith(".mesh") else raw_name
+                mesh_filepath = os.path.join(mesh_dir, mesh_filename)
 
-            print(f"\n[GTA4 EXPORT] ====== Procesez obiect: '{obj.name}' -> mesh_name='{mesh_name}' ======")
-            print(f"[GTA4 EXPORT] Numar vertices: {len(mesh_data.vertices)}")
+                # Aplicam transformarile pe original (comportament existent)
+                bpy.ops.object.select_all(action='DESELECT')
+                original_obj.select_set(True)
+                context.view_layer.objects.active = original_obj
+                try:
+                    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+                except Exception as e:
+                    self.report({'WARNING'}, f"Nu am putut aplica transformarile: {e}")
 
-            # AUTO-ALIGN
-            xs = [v.co.x for v in mesh_data.vertices]
-            ys = [v.co.y for v in mesh_data.vertices]
-            zs = [v.co.z for v in mesh_data.vertices]
-            cur_min_x, cur_max_x = min(xs), max(xs)
-            cur_min_y, cur_max_y = min(ys), max(ys)
-            cur_min_z, cur_max_z = min(zs), max(zs)
-            print(f"[GTA4 EXPORT] Bounds BEFORE align: X[{cur_min_x:.4f}, {cur_max_x:.4f}] Y[{cur_min_y:.4f}, {cur_max_y:.4f}] Z[{cur_min_z:.4f}, {cur_max_z:.4f}]")
+                # Optional: duplicam si pregatim geometria pentru UV per-vertex
+                obj = original_obj
+                if modify_geometry:
+                    try:
+                        duplicate = duplicate_and_prepare_geometry(context, original_obj)
+                        duplicates_to_cleanup.append(duplicate)
+                        obj = duplicate
+                        print(f"[GTA4 EXPORT] Modify geometry: '{original_obj.name}' -> '{duplicate.name}' ({len(duplicate.data.vertices)} verts)")
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Modify geometry a esuat pentru {original_obj.name}: {e}")
+                        obj = original_obj
 
-            if mesh_name in GTA_BOUNDS:
-                tgt_min_x, tgt_min_y, tgt_min_z, tgt_max_x, tgt_max_y, tgt_max_z = GTA_BOUNDS[mesh_name]
-                cur_size_x = cur_max_x - cur_min_x
-                cur_size_y = cur_max_y - cur_min_y
-                cur_size_z = cur_max_z - cur_min_z
-                tgt_size_x = tgt_max_x - tgt_min_x
-                tgt_size_y = tgt_max_y - tgt_min_y
-                tgt_size_z = tgt_max_z - tgt_min_z
-                if cur_size_x > 0 and cur_size_y > 0 and cur_size_z > 0:
-                    sx = tgt_size_x / cur_size_x
-                    sy = tgt_size_y / cur_size_y
-                    sz = tgt_size_z / cur_size_z
-                    for v in mesh_data.vertices:
-                        v.co.x = (v.co.x - cur_min_x) * sx + tgt_min_x
-                        v.co.y = (v.co.y - cur_min_y) * sy + tgt_min_y
-                        v.co.z = (v.co.z - cur_min_z) * sz + tgt_min_z
-                    mesh_data.update()
-                    print(f"[GTA4 EXPORT] AUTO-ALIGNAT! Scale: ({sx:.3f}, {sy:.3f}, {sz:.3f})")
-                    self.report({'INFO'}, f"Auto-aliniat {mesh_name} (scale {sx:.2f})")
-                else:
-                    print(f"[GTA4 EXPORT] WARN: dimensiune 0, skip auto-align")
-            else:
-                print(f"[GTA4 EXPORT] WARN: '{mesh_name}' NU e in GTA_BOUNDS, SKIP auto-align!")
-                self.report({'WARNING'}, f"{mesh_name} nu e in GTA_BOUNDS - auto-align SKIP!")
+                mesh_data = obj.data
+                mesh_data.calc_loop_triangles()
 
-            # Recalculeaza bounds
-            xs = [v.co.x for v in mesh_data.vertices]
-            ys = [v.co.y for v in mesh_data.vertices]
-            zs = [v.co.z for v in mesh_data.vertices]
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            min_z, max_z = min(zs), max(zs)
-            print(f"[GTA4 EXPORT] Bounds AFTER align: X[{min_x:.4f}, {max_x:.4f}] Y[{min_y:.4f}, {max_y:.4f}] Z[{min_z:.4f}, {max_z:.4f}]")
+                print(f"\n[GTA4 EXPORT] ====== Procesez obiect: '{obj.name}' -> mesh_name='{mesh_name}' ======")
+                print(f"[GTA4 EXPORT] Numar vertices: {len(mesh_data.vertices)}")
 
-            center_str = f"{(min_x + max_x) / 2:.8f} {(min_y + max_y) / 2:.8f} {(min_z + max_z) / 2:.8f}"
-            aabbmin_str = f"{min_x:.8f} {min_y:.8f} {min_z:.8f}"
-            aabbmax_str = f"{max_x:.8f} {max_y:.8f} {max_z:.8f}"
-            radius_str = f"{math.sqrt((max_x - min_x) ** 2 + (max_y - min_y) ** 2 + (max_z - min_z) ** 2) / 2:.8f}"
+                # AUTO-ALIGN
+                xs = [v.co.x for v in mesh_data.vertices]
+                ys = [v.co.y for v in mesh_data.vertices]
+                zs = [v.co.z for v in mesh_data.vertices]
+                cur_min_x, cur_max_x = min(xs), max(xs)
+                cur_min_y, cur_max_y = min(ys), max(ys)
+                cur_min_z, cur_max_z = min(zs), max(zs)
+                print(f"[GTA4 EXPORT] Bounds BEFORE align: X[{cur_min_x:.4f}, {cur_max_x:.4f}] Y[{cur_min_y:.4f}, {cur_max_y:.4f}] Z[{cur_min_z:.4f}, {cur_max_z:.4f}]")
 
-            # Recuperare date originale
-            stored_indices = None
-            stored_weights = None
-            stored_tangents = None
-            stored_colors = None
-            try:
-                if "gta_bone_indices" in mesh_data.keys():
-                    stored_indices = json.loads(mesh_data["gta_bone_indices"])
-                    stored_weights = json.loads(mesh_data["gta_bone_weights"])
-                    stored_tangents = json.loads(mesh_data["gta_tangents"])
-                    stored_colors = json.loads(mesh_data["gta_colors"])
-            except Exception as e:
-                self.report({'WARNING'}, f"Eroare: {e}")
-
-            # Preserve raw data for an untouched imported mesh.  For edited
-            # geometry Blender vertex groups are the source of truth: edit
-            # operations interpolate them, while old per-vertex metadata no
-            # longer matches the changed vertex count.
-            has_vertex_group_weights = any(
-                any(group.weight > 0.0 and obj.vertex_groups[group.group].name in name_to_idx
-                    for group in vertex.groups)
-                for vertex in mesh_data.vertices
-            )
-            use_original = (stored_indices is not None
-                            and len(stored_indices) == len(mesh_data.vertices)
-                            and all(has_valid_gta_weights(weights) for weights in stored_weights))
-
-            reference_obj = None
-            reference_indices = None
-            reference_weights = None
-            head_reference_obj = None
-            # A GTA IV facial head needs its original per-vertex skin mapping.
-            # Data Transfer cannot reproduce that mapping reliably when the
-            # replacement has a different vertex count/topology.
-            if not use_original and mesh_name != "head_000_r":
-                reference_obj, reference_indices, reference_weights = find_reference_skin_source(obj, mesh_name)
-            elif not use_original and mesh_name == "head_000_r":
-                head_reference_obj, _, _ = find_reference_skin_source(obj, mesh_name)
-                if (head_reference_obj is not None
-                        and len(head_reference_obj.data.vertices) != len(mesh_data.vertices)):
-                    self.report({'ERROR'},
-                        "head_000_r: topologie diferita. Porneste din capul original, NU adauga/sterge vertex-uri, apoi modeleaza-l.")
-                    print("[GTA4 EXPORT] STOP head_000_r: "
-                          f"{len(mesh_data.vertices)} verts vs referinta {len(head_reference_obj.data.vertices)}. "
-                          "Skin-ul facial GTA IV necesita topologia originala.")
-                    return {'CANCELLED'}
-            use_reference_skin = reference_obj is not None
-            has_safe_ped_skin = has_non_rigid_ped_skin(mesh_name, obj, name_to_idx)
-
-            if use_original:
-                print(f"[GTA4 EXPORT] Folosesc metadata originala ({len(stored_indices)} verts)")
-            elif use_reference_skin:
-                print(f"[GTA4 EXPORT] Transfer skin raw din '{reference_obj.name}' ({len(reference_indices)} verts)")
-            elif has_vertex_group_weights and has_safe_ped_skin:
-                print("[GTA4 EXPORT] Folosesc vertex groups Blender si encodez weights cumulative GTA IV")
-            else:
-                if mesh_name in ("head_000_r", "hand_000_r") and not has_safe_ped_skin:
-                    self.report({'ERROR'}, f"{mesh_name}: skinning rigid detectat. Importa mesh-ul ORIGINAL, transfera weights, apoi exporta.")
-                else:
-                    self.report({'ERROR'}, f"{mesh_name}: mesh fara skin weights. Importa mesh-ul original si pastreaza/transfera vertex groups.")
-                return {'CANCELLED'}
-
-            reference_skin_tree = None
-            if use_reference_skin:
-                reference_skin_tree = build_reference_skin_tree(reference_obj.data.vertices)
-
-            with open(mesh_filepath, 'w', encoding='utf-8', newline='\r\n') as f:
-                f.write("Version 11 13\n{\n\tSkinned 1\n\tMtl 0\n\t{\n\t\tPrim 0\n\t\t{\n")
-                tri_count = len(mesh_data.loop_triangles)
-                f.write(f"\t\t\tIdx {tri_count * 3}\n\t\t\t{{\n")
-                buffer = []
-                for tri in mesh_data.loop_triangles:
-                    buffer.extend([tri.vertices[0], tri.vertices[1], tri.vertices[2]])
-                    if len(buffer) >= 15:
-                        f.write("\t\t\t\t" + " ".join(str(x) for x in buffer) + "\n")
-                        buffer = []
-                if buffer:
-                    f.write("\t\t\t\t" + " ".join(str(x) for x in buffer) + "\n")
-                f.write("\t\t\t}\n")
-                f.write(f"\t\t\tVerts {len(mesh_data.vertices)}\n\t\t\t{{\n")
-                uv_layer = mesh_data.uv_layers.active.data if mesh_data.uv_layers.active else None
-
-                for v_idx, v in enumerate(mesh_data.vertices):
-                    pos = f"{v.co.x:.8f} {v.co.y:.8f} {v.co.z:.8f}"
-                    norm = f"{v.normal.x:.8f} {v.normal.y:.8f} {v.normal.z:.8f}"
-
-                    if use_original:
-                        b_idx = stored_indices[v_idx]
-                        b_wgt = stored_weights[v_idx]
-                        tang = stored_tangents[v_idx]
-                        col = stored_colors[v_idx]
-                    elif use_reference_skin:
-                        b_idx, b_wgt = nearest_reference_skin(
-                            v, reference_skin_tree, reference_indices, reference_weights)
-                        tang = [0.0, 0.0, 0.0, 1.0]
-                        col = [1.0, 1.0, 1.0, 0.0]
+                if mesh_name in GTA_BOUNDS:
+                    tgt_min_x, tgt_min_y, tgt_min_z, tgt_max_x, tgt_max_y, tgt_max_z = GTA_BOUNDS[mesh_name]
+                    cur_size_x = cur_max_x - cur_min_x
+                    cur_size_y = cur_max_y - cur_min_y
+                    cur_size_z = cur_max_z - cur_min_z
+                    tgt_size_x = tgt_max_x - tgt_min_x
+                    tgt_size_y = tgt_max_y - tgt_min_y
+                    tgt_size_z = tgt_max_z - tgt_min_z
+                    if cur_size_x > 0 and cur_size_y > 0 and cur_size_z > 0:
+                        sx = tgt_size_x / cur_size_x
+                        sy = tgt_size_y / cur_size_y
+                        sz = tgt_size_z / cur_size_z
+                        for v in mesh_data.vertices:
+                            v.co.x = (v.co.x - cur_min_x) * sx + tgt_min_x
+                            v.co.y = (v.co.y - cur_min_y) * sy + tgt_min_y
+                            v.co.z = (v.co.z - cur_min_z) * sz + tgt_min_z
+                        mesh_data.update()
+                        print(f"[GTA4 EXPORT] AUTO-ALIGNAT! Scale: ({sx:.3f}, {sy:.3f}, {sz:.3f})")
+                        self.report({'INFO'}, f"Auto-aliniat {mesh_name} (scale {sx:.2f})")
                     else:
-                        vg_weights = []
-                        for g in v.groups:
-                            if g.weight > 0.0:
-                                gname = obj.vertex_groups[g.group].name
-                                if gname in name_to_idx:
-                                    vg_weights.append((name_to_idx[gname], g.weight))
-                        b_idx, b_wgt = encode_gta_weights(vg_weights)
-                        tang = [0.0, 0.0, 0.0, 1.0]
-                        col = [1.0, 1.0, 1.0, 0.0]
+                        print(f"[GTA4 EXPORT] WARN: dimensiune 0, skip auto-align")
+                else:
+                    print(f"[GTA4 EXPORT] WARN: '{mesh_name}' NU e in GTA_BOUNDS, SKIP auto-align!")
+                    self.report({'WARNING'}, f"{mesh_name} nu e in GTA_BOUNDS - auto-align SKIP!")
 
-                    col_str = f"{col[0]:.8f} {col[1]:.8f} {col[2]:.8f} {col[3]:.8f}"
-                    bones_str = f"{b_idx[0]} {b_idx[1]} {b_idx[2]} {b_idx[3]}"
-                    weights_str = f"{b_wgt[0]} {b_wgt[1]} {b_wgt[2]} {b_wgt[3]}"
-                    tang_str = f"{tang[0]:.8f} {tang[1]:.8f} {tang[2]:.8f} {tang[3]:.8f}"
+                # Recalculeaza bounds
+                xs = [v.co.x for v in mesh_data.vertices]
+                ys = [v.co.y for v in mesh_data.vertices]
+                zs = [v.co.z for v in mesh_data.vertices]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                min_z, max_z = min(zs), max(zs)
+                print(f"[GTA4 EXPORT] Bounds AFTER align: X[{min_x:.4f}, {max_x:.4f}] Y[{min_y:.4f}, {max_y:.4f}] Z[{min_z:.4f}, {max_z:.4f}]")
 
-                    uv = (0.0, 0.0)
-                    if uv_layer:
-                        for loop_idx, loop in enumerate(mesh_data.loops):
-                            if loop.vertex_index == v_idx:
-                                uv = uv_layer[loop_idx].uv
-                                break
-                    uv_str = f"{uv[0]:.8f} {1.0 - uv[1]:.8f}"
+                center_str = f"{(min_x + max_x) / 2:.8f} {(min_y + max_y) / 2:.8f} {(min_z + max_z) / 2:.8f}"
+                aabbmin_str = f"{min_x:.8f} {min_y:.8f} {min_z:.8f}"
+                aabbmax_str = f"{max_x:.8f} {max_y:.8f} {max_z:.8f}"
+                radius_str = f"{math.sqrt((max_x - min_x) ** 2 + (max_y - min_y) ** 2 + (max_z - min_z) ** 2) / 2:.8f}"
 
-                    f.write(f"\t\t\t\t{pos} / {norm} / {col_str} / {bones_str} / {weights_str} / {tang_str} / {uv_str} / 0.0 0.0\n")
-                f.write("\t\t\t}\n\t\t}\n\t}\n}\n")
+                # Recuperare date originale (doar pentru originalul neduplicat)
+                stored_indices = None
+                stored_weights = None
+                stored_tangents = None
+                stored_colors = None
+                try:
+                    if "gta_bone_indices" in mesh_data.keys():
+                        stored_indices = json.loads(mesh_data["gta_bone_indices"])
+                        stored_weights = json.loads(mesh_data["gta_bone_weights"])
+                        stored_tangents = json.loads(mesh_data["gta_tangents"])
+                        stored_colors = json.loads(mesh_data["gta_colors"])
+                except Exception as e:
+                    self.report({'WARNING'}, f"Eroare: {e}")
 
-            print(f"[GTA4 EXPORT] Scris: {mesh_filepath}")
+                has_vertex_group_weights = any(
+                    any(group.weight > 0.0 and obj.vertex_groups[group.group].name in name_to_idx
+                        for group in vertex.groups)
+                    for vertex in mesh_data.vertices
+                )
+                use_original = (stored_indices is not None
+                                and len(stored_indices) == len(mesh_data.vertices)
+                                and all(has_valid_gta_weights(weights) for weights in stored_weights))
 
-            shader_line = SHADER_MAP.get(mesh_name, "gta_ped.sps givemechecker givemechecker 35.00000000 0.20000000 1.00000000;0.00000000;0.00000000 givemechecker 1.00000000")
-            odd_content += f"\tgtaDrawable {mesh_name}\n\t{{\n"
-            odd_content += "\t\tshadinggroup\n\t\t{\n\t\t\tShaders 1\n\t\t\t{\n"
-            odd_content += f"\t\t\t\t{shader_line}\n"
-            odd_content += "\t\t\t}\n\t\t}\n"
-            odd_content += f"\t\tskel\n\t\t{{\n\t\t\tskel {skel_name}\\{skel_name}.skel\n\t\t}}\n"
-            odd_content += "\t\tlodgroup\n\t\t{\n"
-            odd_content += f"\t\t\thigh 1 {base_name}\\{mesh_filename} 0 9999.00000000\n"
-            odd_content += "\t\t\tmed none 9999.00000000\n\t\t\tlow none 9999.00000000\n\t\t\tvlow none 9999.00000000\n"
-            odd_content += f"\t\t\tcenter {center_str}\n"
-            odd_content += f"\t\t\tAABBMin {aabbmin_str}\n"
-            odd_content += f"\t\t\tAABBMax {aabbmax_str}\n"
-            odd_content += f"\t\t\tradius {radius_str}\n"
-            odd_content += "\t\t}\n\t}\n"
+                reference_obj = None
+                reference_indices = None
+                reference_weights = None
+                reference_tangents = None
+                reference_colors = None
+                if not use_original:
+                    reference_obj, reference_indices, reference_weights = find_reference_skin_source(obj, mesh_name)
+                    if reference_obj is not None:
+                        try:
+                            reference_tangents = json.loads(reference_obj.data["gta_tangents"])
+                            reference_colors = json.loads(reference_obj.data["gta_colors"])
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                            reference_tangents = None
+                            reference_colors = None
+                use_reference_skin = reference_obj is not None
+                has_safe_ped_skin = has_non_rigid_ped_skin(mesh_name, obj, name_to_idx)
+
+                if use_original:
+                    print(f"[GTA4 EXPORT] Folosesc metadata originala ({len(stored_indices)} verts)")
+                elif use_reference_skin:
+                    print(f"[GTA4 EXPORT] Transfer skin raw din '{reference_obj.name}' ({len(reference_indices)} verts)")
+                elif has_vertex_group_weights and has_safe_ped_skin:
+                    print("[GTA4 EXPORT] Folosesc vertex groups Blender si encodez weights cumulative GTA IV")
+                else:
+                    if mesh_name in ("head_000_r", "hand_000_r") and not has_safe_ped_skin:
+                        self.report({'ERROR'}, f"{mesh_name}: skinning rigid detectat. Importa mesh-ul ORIGINAL, transfera weights, apoi exporta.")
+                    else:
+                        self.report({'ERROR'}, f"{mesh_name}: mesh fara skin weights. Importa mesh-ul original si pastreaza/transfera vertex groups.")
+                    return {'CANCELLED'}
+
+                reference_skin_tree = None
+                reference_skin_triangles = None
+                if use_reference_skin:
+                    reference_skin_tree, reference_skin_triangles = build_reference_skin_surface(reference_obj)
+                    if reference_skin_tree is None:
+                        self.report({'ERROR'}, f"{mesh_name}: referinta nu are triunghiuri pentru skin transfer.")
+                        return {'CANCELLED'}
+                    print(f"[GTA4 EXPORT] Transfer pe suprafata: {len(reference_skin_triangles)} triunghiuri")
+
+                max_skin_transfer_distance = 0.0
+
+                # Precompute vertex -> UV map (fosta cautare era O(V*L))
+                uv_layer_data = mesh_data.uv_layers.active.data if mesh_data.uv_layers.active else None
+                vertex_uv_cache = [None] * len(mesh_data.vertices)
+                if uv_layer_data:
+                    for loop in mesh_data.loops:
+                        vi = loop.vertex_index
+                        if vi < len(vertex_uv_cache) and vertex_uv_cache[vi] is None:
+                            vertex_uv_cache[vi] = uv_layer_data[loop.index].uv
+
+                with open(mesh_filepath, 'w', encoding='utf-8', newline='\r\n') as f:
+                    f.write("Version 11 13\n{\n\tSkinned 1\n\tMtl 0\n\t{\n\t\tPrim 0\n\t\t{\n")
+                    tri_count = len(mesh_data.loop_triangles)
+                    f.write(f"\t\t\tIdx {tri_count * 3}\n\t\t\t{{\n")
+                    buffer = []
+                    for tri in mesh_data.loop_triangles:
+                        buffer.extend([tri.vertices[0], tri.vertices[1], tri.vertices[2]])
+                        if len(buffer) >= 15:
+                            f.write("\t\t\t\t" + " ".join(str(x) for x in buffer) + "\n")
+                            buffer = []
+                    if buffer:
+                        f.write("\t\t\t\t" + " ".join(str(x) for x in buffer) + "\n")
+                    f.write("\t\t\t}\n")
+                    f.write(f"\t\t\tVerts {len(mesh_data.vertices)}\n\t\t\t{{\n")
+
+                    for v_idx, v in enumerate(mesh_data.vertices):
+                        pos = f"{v.co.x:.8f} {v.co.y:.8f} {v.co.z:.8f}"
+                        norm = f"{v.normal.x:.8f} {v.normal.y:.8f} {v.normal.z:.8f}"
+
+                        if use_original:
+                            b_idx = stored_indices[v_idx]
+                            b_wgt = stored_weights[v_idx]
+                            tang = stored_tangents[v_idx]
+                            col = stored_colors[v_idx]
+                        elif use_reference_skin:
+                            b_idx, b_wgt, source_vertices, barycentric, distance = interpolate_reference_skin(
+                                v, reference_obj, reference_skin_tree, reference_skin_triangles,
+                                reference_indices, reference_weights)
+                            max_skin_transfer_distance = max(max_skin_transfer_distance, distance)
+                            tang, col, _reference_uv = interpolate_reference_attributes(
+                                source_vertices, barycentric, reference_tangents, reference_colors, None)
+                        else:
+                            vg_weights = []
+                            for g in v.groups:
+                                if g.weight > 0.0:
+                                    gname = obj.vertex_groups[g.group].name
+                                    if gname in name_to_idx:
+                                        vg_weights.append((name_to_idx[gname], g.weight))
+                            b_idx, b_wgt = encode_gta_weights(vg_weights)
+                            tang = [0.0, 0.0, 0.0, 1.0]
+                            col = [1.0, 1.0, 1.0, 0.0]
+
+                        col_str = f"{col[0]:.8f} {col[1]:.8f} {col[2]:.8f} {col[3]:.8f}"
+                        bones_str = f"{b_idx[0]} {b_idx[1]} {b_idx[2]} {b_idx[3]}"
+                        weights_str = f"{b_wgt[0]} {b_wgt[1]} {b_wgt[2]} {b_wgt[3]}"
+                        tang_str = f"{tang[0]:.8f} {tang[1]:.8f} {tang[2]:.8f} {tang[3]:.8f}"
+
+                        cached_uv = vertex_uv_cache[v_idx] if v_idx < len(vertex_uv_cache) else None
+                        uv = cached_uv if cached_uv is not None else (0.0, 0.0)
+                        uv_str = f"{uv[0]:.8f} {1.0 - uv[1]:.8f}"
+
+                        f.write(f"\t\t\t\t{pos} / {norm} / {col_str} / {bones_str} / {weights_str} / {tang_str} / {uv_str} / 0.0 0.0\n")
+                    f.write("\t\t\t}\n\t\t}\n\t}\n}\n")
+
+                print(f"[GTA4 EXPORT] Scris: {mesh_filepath}")
+                if use_reference_skin:
+                    print(f"[GTA4 EXPORT] Distanta maxima pana la referinta pentru skin transfer: "
+                          f"{max_skin_transfer_distance:.6f}")
+                    if max_skin_transfer_distance > 0.05:
+                        self.report({'WARNING'},
+                            f"{mesh_name}: unele vertex-uri sunt la {max_skin_transfer_distance:.3f} de capul original; verifica skinning-ul in Blender.")
+
+                shader_line = SHADER_MAP.get(mesh_name, "gta_ped.sps givemechecker givemechecker 35.00000000 0.20000000 1.00000000;0.00000000;0.00000000 givemechecker 1.00000000")
+                odd_content += f"\tgtaDrawable {mesh_name}\n\t{{\n"
+                odd_content += "\t\tshadinggroup\n\t\t{\n\t\t\tShaders 1\n\t\t\t{\n"
+                odd_content += f"\t\t\t\t{shader_line}\n"
+                odd_content += "\t\t\t}\n\t\t}\n"
+                odd_content += f"\t\tskel\n\t\t{{\n\t\t\tskel {skel_name}\\{skel_name}.skel\n\t\t}}\n"
+                odd_content += "\t\tlodgroup\n\t\t{\n"
+                odd_content += f"\t\t\thigh 1 {base_name}\\{mesh_filename} 0 9999.00000000\n"
+                odd_content += "\t\t\tmed none 9999.00000000\n\t\t\tlow none 9999.00000000\n\t\t\tvlow none 9999.00000000\n"
+                odd_content += f"\t\t\tcenter {center_str}\n"
+                odd_content += f"\t\t\tAABBMin {aabbmin_str}\n"
+                odd_content += f"\t\t\tAABBMax {aabbmax_str}\n"
+                odd_content += f"\t\t\tradius {radius_str}\n"
+                odd_content += "\t\t}\n\t}\n"
+        finally:
+            # Curatare: stergem toate duplicatele create pentru modify_geometry
+            for dup in duplicates_to_cleanup:
+                try:
+                    if dup.name in bpy.data.objects:
+                        bpy.data.objects.remove(dup, do_unlink=True)
+                except Exception:
+                    pass
+
         odd_content += "}\n"
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(odd_content)
@@ -628,7 +768,11 @@ class GTA4_PT_MainPanel(bpy.types.Panel):
         layout.operator(GTA4_OT_ImportSkel.bl_idname, icon='ARMATURE_DATA')
         layout.operator(GTA4_OT_ImportMesh.bl_idname, icon='MESH_DATA')
         layout.separator()
-        layout.label(text="2. Export:")
+        layout.label(text="2. Optiuni Export:")
+        layout.prop(context.scene, "gta4_modify_geometry", icon='MOD_EDGESPLIT')
+        layout.label(text="(bifeaza pt. mesh-uri proprii)", icon='INFO')
+        layout.separator()
+        layout.label(text="3. Export:")
         layout.operator(GTA4_OT_ExportWDD.bl_idname, icon='EXPORT')
         layout.separator()
         layout.label(text="Vezi consola pt debug!")
@@ -640,12 +784,27 @@ def register():
     bpy.utils.register_class(GTA4_OT_ExportWDD)
     bpy.utils.register_class(GTA4_PT_MainPanel)
 
+    bpy.types.Scene.gta4_modify_geometry = BoolProperty(
+        name="Modify Geometry",
+        description=(
+            "Despica toate muchiile astfel incat fiecare vertex sa aiba un singur UV. "
+            "Necesar pentru mesh-uri care nu au fost create pentru GTA IV "
+            "(rezolva textura distorsionata). Creste numarul de vertices (~3x)"
+        ),
+        default=False,
+    )
+
 
 def unregister():
     bpy.utils.unregister_class(GTA4_OT_ImportSkel)
     bpy.utils.unregister_class(GTA4_OT_ImportMesh)
     bpy.utils.unregister_class(GTA4_OT_ExportWDD)
     bpy.utils.unregister_class(GTA4_PT_MainPanel)
+
+    try:
+        del bpy.types.Scene.gta4_modify_geometry
+    except AttributeError:
+        pass
 
 
 if __name__ == "__main__":
